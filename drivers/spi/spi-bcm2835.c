@@ -1084,6 +1084,29 @@ static int bcm2835_spi_transfer_one_poll(struct spi_controller *ctlr,
 	return 0;
 }
 
+static unsigned long bcm2835_get_clkdiv(struct bcm2835_spi *bs, u32 spi_hz,
+					u32 *effective_speed_hz)
+{
+	unsigned long cdiv;
+
+	if (spi_hz >= bs->clk_hz / 2) {
+		cdiv = 2; /* clk_hz/2 is the fastest we can go */
+	} else if (spi_hz) {
+		/* CDIV must be a multiple of two */
+		cdiv = DIV_ROUND_UP(bs->clk_hz, spi_hz);
+		cdiv += (cdiv % 2);
+
+		if (cdiv >= 65536)
+			cdiv = 0; /* 0 is the slowest we can go */
+	} else {
+		cdiv = 0; /* 0 is the slowest we can go */
+	}
+
+	*effective_speed_hz = cdiv ? (bs->clk_hz / cdiv) : (bs->clk_hz / 65536);
+
+	return cdiv;
+}
+
 static int bcm2835_spi_transfer_one(struct spi_controller *ctlr,
 				    struct spi_device *spi,
 				    struct spi_transfer *tfr)
@@ -1106,19 +1129,7 @@ static int bcm2835_spi_transfer_one(struct spi_controller *ctlr,
 	/* set clock */
 	spi_hz = tfr->speed_hz;
 
-	if (spi_hz >= bs->clk_hz / 2) {
-		cdiv = 2; /* clk_hz/2 is the fastest we can go */
-	} else if (spi_hz) {
-		/* CDIV must be a multiple of two */
-		cdiv = DIV_ROUND_UP(bs->clk_hz, spi_hz);
-		cdiv += (cdiv % 2);
-
-		if (cdiv >= 65536)
-			cdiv = 0; /* 0 is the slowest we can go */
-	} else {
-		cdiv = 0; /* 0 is the slowest we can go */
-	}
-	tfr->effective_speed_hz = cdiv ? (bs->clk_hz / cdiv) : (bs->clk_hz / 65536);
+	cdiv = bcm2835_get_clkdiv(bs, spi_hz, &tfr->effective_speed_hz);
 	bcm2835_wr(bs, BCM2835_SPI_CLK, cdiv);
 
 	/* handle all the 3-wire mode */
@@ -1294,6 +1305,68 @@ static int bcm2835_spi_setup(struct spi_device *spi)
 	return 0;
 }
 
+#ifdef CONFIG_SPI_BCM2835_OOB
+
+static int bcm2835_spi_prepare_oob_transfer(struct spi_controller *ctlr,
+					struct spi_oob_transfer *xfer)
+{
+	/*
+	 * The size of a transfer is limited by DLEN which is 16-bit
+	 * wide, and we don't want to scatter transfers in out-of-band
+	 * mode, so cap the frame size accordingly.
+	 */
+	if (xfer->setup.frame_len > 65532)
+		return -EINVAL;
+
+	return 0;
+}
+
+static void bcm2835_spi_start_oob_transfer(struct spi_controller *ctlr,
+					struct spi_oob_transfer *xfer)
+{
+	struct bcm2835_spi *bs = spi_controller_get_devdata(ctlr);
+	struct spi_device *spi = xfer->spi;
+	u32 cs = bs->prepare_cs[spi->chip_select], effective_speed_hz;
+	unsigned long cdiv;
+
+	/* See bcm2835_spi_prepare_message(). */
+	bcm2835_wr(bs, BCM2835_SPI_CS, cs);
+
+	cdiv = bcm2835_get_clkdiv(bs, xfer->setup.speed_hz, &effective_speed_hz);
+	xfer->effective_speed_hz = effective_speed_hz;
+	bcm2835_wr(bs, BCM2835_SPI_CLK, cdiv);
+	bcm2835_wr(bs, BCM2835_SPI_DLEN, xfer->setup.frame_len);
+
+	if (spi->mode & SPI_3WIRE)
+		cs |= BCM2835_SPI_CS_REN;
+	bcm2835_wr(bs, BCM2835_SPI_CS,
+		   cs | BCM2835_SPI_CS_TA | BCM2835_SPI_CS_DMAEN);
+}
+
+static void bcm2835_spi_pulse_oob_transfer(struct spi_controller *ctlr,
+					struct spi_oob_transfer *xfer)
+{
+	struct bcm2835_spi *bs = spi_controller_get_devdata(ctlr);
+
+	/* Reload DLEN for the next pulse. */
+	bcm2835_wr(bs, BCM2835_SPI_DLEN, xfer->setup.frame_len);
+}
+
+static void bcm2835_spi_terminate_oob_transfer(struct spi_controller *ctlr,
+					struct spi_oob_transfer *xfer)
+{
+	struct bcm2835_spi *bs = spi_controller_get_devdata(ctlr);
+
+	bcm2835_spi_reset_hw(bs);
+}
+
+#else
+#define bcm2835_spi_prepare_oob_transfer	NULL
+#define bcm2835_spi_start_oob_transfer		NULL
+#define bcm2835_spi_pulse_oob_transfer		NULL
+#define bcm2835_spi_terminate_oob_transfer	NULL
+#endif
+
 static int bcm2835_spi_probe(struct platform_device *pdev)
 {
 	struct spi_controller *ctlr;
@@ -1320,6 +1393,10 @@ static int bcm2835_spi_probe(struct platform_device *pdev)
 	ctlr->transfer_one = bcm2835_spi_transfer_one;
 	ctlr->handle_err = bcm2835_spi_handle_err;
 	ctlr->prepare_message = bcm2835_spi_prepare_message;
+	ctlr->prepare_oob_transfer = bcm2835_spi_prepare_oob_transfer;
+	ctlr->start_oob_transfer = bcm2835_spi_start_oob_transfer;
+	ctlr->pulse_oob_transfer = bcm2835_spi_pulse_oob_transfer;
+	ctlr->terminate_oob_transfer = bcm2835_spi_terminate_oob_transfer;
 	ctlr->dev.of_node = pdev->dev.of_node;
 
 	bs = spi_controller_get_devdata(ctlr);
